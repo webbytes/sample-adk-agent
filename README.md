@@ -28,12 +28,23 @@ flowchart TD
 
     Root -->|"Technical Question"| WF["parallel_knowledge_lookup (ADK 2.0 Workflow)"]
     WF --> BranchA["retrieve_from_trail_and_memory\n(Ranked Trail + search_memory)"]
-    WF --> BranchB["web_grounding_agent (mode='single_turn')\nIsolated Google Search Grounding"]
+    WF --> BranchB["web_grounding_agent (gemini-3.5-flash)\nIsolated Google Search Grounding"]
     BranchA --> Join["JoinNode (join_knowledge_sources)"]
     BranchB --> Join
-    Join --> Judge["answer_judge_agent (output_schema=JudgedAnswer, temp=0.0)\nSelects trail_memory | google_search | combined + citations"]
-    Judge --> Root
+    Join --> Router{"route_judge_by_complexity\n(Strategic Model Router)"}
+    Router -->|"Single-source factual"| FastJudge["fast_answer_judge_agent (gemini-3.8-flash)\nLow-latency Flash Judge (temp=0.0)"]
+    Router -->|"Multi-source / Architectural"| ProJudge["pro_answer_judge_agent (gemini-3.1-pro-preview)\nDeep-reasoning Pro Judge (temp=0.0)"]
+    FastJudge --> Root
+    ProJudge --> Root
 ```
+
+### Strategic Model Routing (Cost, Latency & Reasoning Tiers)
+
+Instead of hardcoding a single LLM across every sub-task, the agent routes across three specialized Gemini tiers (each overridable via environment variables `RETRIEVAL_MODEL`, `ORCHESTRATOR_MODEL`, `REASONING_MODEL`):
+
+1. **Retrieval Tier (`gemini-3.5-flash` -> `web_grounding_agent`):** High-throughput, cost-efficient Flash model dedicated to parallel Google Search grounding and URL extraction.
+2. **Multimodal & Fast Orchestration Tier (`gemini-3.8-flash` -> `root_agent`, `fast_answer_judge_agent`):** Handles browser screenshot visual extraction, deterministic tool calling, and sub-second `fast_judge` evaluation for single-source factual lookups.
+3. **Deep Reasoning Tier (`gemini-3.1-pro-preview` -> `pro_answer_judge_agent`):** Dynamically selected via `Event(route="pro_judge")` in `route_judge_by_complexity` whenever a query requires reconciling both Personal Trail Memory and Live Web Search or involves architectural/comparative trade-off reasoning.
 
 ---
 
@@ -43,7 +54,7 @@ flowchart TD
 | :--- | :--- | :--- |
 | **1. Tool & Interface Design** | Six single-responsibility typed `FunctionTool`s with Pydantic `BaseModel` validation (`TrailEntry`, `OnboardingProfile`, `KnowledgeQueryInput`, `JudgedAnswer`), `ToolContext` state isolation, deterministic `fetch_failed` -> screenshot fallback, `get_user_choice` (`LongRunningFunctionTool`) for zero-typing approval, and an A2A (`Agent2Agent`) JSON-RPC + `/.well-known/agent-card.json` server interface. | `app/tools.py`, `app/schemas.py`, `app/app_utils/a2a.py` |
 | **2. Context & Memory** | Three complementary persistence layers: (1) `user:`-prefixed session state (`user:trail_library`, `user:categories`, `user:onboarding_profile`) injected via `{user:...}` instruction templates plus `EventsCompactionConfig`; (2) cross-session semantic recall via `VertexAiMemoryBankService` (Agent Runtime) / `InMemoryMemoryService` (local) automatically synced on `after_run_callback` and queried via `load_memory` & `ctx.search_memory`; (3) screenshot binary archival via `GcsArtifactService` / `InMemoryArtifactService` + `load_artifacts`. | `app/tools.py`, `app/app_utils/services.py`, `app/observability.py`, `app/agent.py` |
-| **3. Orchestration & Logic** | Combines conversational multimodal routing on `root_agent` with an explicit ADK 2.0 `Workflow` DAG (`parallel_knowledge_lookup`): concurrent tuple fan-out to `retrieve_from_trail_and_memory` and an isolated `mode="single_turn"` `web_grounding_agent` (preventing Gemini `google_search` + function-tool `400 INVALID_ARGUMENT` conflicts), synchronization at `JoinNode`, and deterministic evaluation by `answer_judge_agent` (`output_schema=JudgedAnswer`, `temperature=0.0`), plus `ResumabilityConfig(is_resumable=True)` and `ReflectAndRetryToolPlugin`. | `app/workflows.py`, `app/agent.py` |
+| **3. Orchestration & Logic** | Combines multimodal routing on `root_agent` (`gemini-3.8-flash`) with an ADK 2.0 `Workflow` DAG (`parallel_knowledge_lookup`): concurrent tuple fan-out to `retrieve_from_trail_and_memory` and an isolated `mode="single_turn"` `web_grounding_agent` (`gemini-3.5-flash`), synchronization at `JoinNode`, **strategic model routing** (`route_judge_by_complexity` emitting `Event(route="fast_judge" \| "pro_judge")`) between `fast_answer_judge_agent` (`gemini-3.8-flash`) and `pro_answer_judge_agent` (`gemini-3.1-pro-preview`, `output_schema=JudgedAnswer`, `temperature=0.0`), plus `ResumabilityConfig(is_resumable=True)` and `ReflectAndRetryToolPlugin`. | `app/workflows.py`, `app/agent.py` |
 | **4. Observability & Tracing** | Custom stateless `TrailObservabilityPlugin(BasePlugin)` recording custom OpenTelemetry spans (`onboarding_trail.user_message`, `onboarding_trail.agent.*`, `onboarding_trail.tool.*`, `onboarding_trail.workflow.*`), per-tool latency (`duration_ms`), token usage (`prompt_token_count`, `candidates_token_count`, `thoughts_token_count`), judge source selection metrics, and structured JSON logs for Cloud Logging alongside Cloud Trace export (`otel_to_cloud`). | `app/observability.py`, `app/fast_api_app.py` |
 | **5. Infrastructure & CI/CD** | Production multi-stage `Dockerfile`, Terraform IaC (`deployment/terraform/`) targeting Vertex AI Agent Runtime with least-privilege IAM and Cloud Storage telemetry buckets, GitHub Actions pipelines (`pr_checks.yaml` for Ruff linting + offline `pytest` unit/workflow tests + gated WIF cloud integration tests, `staging.yaml`, and `deploy-to-prod.yaml`), load tests (`tests/load_test/`), and LLM-as-judge evaluation suite (`tests/eval/`). | `Dockerfile`, `deployment/terraform/`, `.github/workflows/`, `tests/` |
 

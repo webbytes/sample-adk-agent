@@ -128,3 +128,7 @@ class JudgedAnswer(BaseModel):
         default_factory=list,
         description="Exact source URLs supporting the answer.",
     )
+    judge_tier: str = Field(
+        default="",
+        description="Model routing tier selected by the complexity router ('fast_judge' or 'pro_judge').",
+    )

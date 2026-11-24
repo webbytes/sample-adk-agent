@@ -12,9 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Personal Onboarding Trail Agent built with Google ADK 2.0."""
+"""Personal Onboarding Trail Agent built with Google ADK 2.0.
+
+Implements a 3-tier strategic model routing architecture:
+  1. RETRIEVAL_MODEL ('gemini-3.5-flash'): High-throughput, low-cost Google Search
+     extraction in the parallel retrieval branch.
+  2. MODEL ('gemini-3.8-flash'): Multimodal screenshot OCR, deterministic tool
+     calling on root_agent, and low-latency single-source answer judging.
+  3. REASONING_MODEL ('gemini-3.1-pro-preview'): Deep multi-source reconciliation
+     and architectural trade-off synthesis when dynamically escalated by the
+     Workflow complexity router.
+"""
 
 from __future__ import annotations
+
+import os
 
 from google.adk.agents import Agent
 from google.adk.apps import App, ResumabilityConfig
@@ -36,7 +48,10 @@ from app.tools import (
 )
 from app.workflows import build_parallel_knowledge_workflow
 
-MODEL = "gemini-3.8-flash"
+# Strategic Model Routing Tiers (overridable via environment variables)
+RETRIEVAL_MODEL = os.getenv("RETRIEVAL_MODEL", "gemini-3.5-flash")
+MODEL = os.getenv("ORCHESTRATOR_MODEL", "gemini-3.8-flash")
+REASONING_MODEL = os.getenv("REASONING_MODEL", "gemini-3.1-pro-preview")
 
 _RETRY_OPTIONS = types.HttpRetryOptions(attempts=3)
 
@@ -64,20 +79,21 @@ AGENT_INSTRUCTION = f"""You are the Personal Onboarding Trail Assistant, a daily
    - Whenever the user shares their role, team/domain, active study topics, learning goals, or completed topics, call `update_onboarding_profile` so you remember their context across sessions.
    - When the user asks what they have saved or what categories exist, call `list_trail_status` or `search_trail_library`.
 
-5. **Parallel Knowledge Lookup & Judge (Technical Questions)**:
-   - For technical or "how/why/what" onboarding questions, call `parallel_knowledge_lookup` with a self-contained `question`. It queries the user's saved Trail & Memory Bank and live Google Search in parallel, then runs a judge agent to select the stronger answer.
-   - Present the answer concisely, explicitly state which source won (`trail_memory`, `google_search`, or `combined`), and list the exact citation URLs.
+5. **Parallel Knowledge Lookup & Strategic Judge Routing (Technical Questions)**:
+   - For technical or "how/why/what" onboarding questions, call `parallel_knowledge_lookup` with a self-contained `question`. It queries the user's saved Trail & Memory Bank and live Google Search in parallel, then routes simple single-source lookups to a fast Flash judge and complex/multi-source syntheses to a Pro reasoning judge.
+   - Present the answer concisely, explicitly state which source won (`trail_memory`, `google_search`, or `combined`) and which judge tier (`fast_judge` or `pro_judge`) evaluated it, and list the exact citation URLs.
 """
 
 
-def create_model() -> Gemini:
-    """Create a Gemini model client configured with standard HTTP retries."""
-    return Gemini(model=MODEL, retry_options=_RETRY_OPTIONS)
+def create_model(model_name: str = MODEL) -> Gemini:
+    """Create a Gemini model client for the requested strategic routing tier."""
+    return Gemini(model=model_name, retry_options=_RETRY_OPTIONS)
 
 
 parallel_knowledge_lookup = build_parallel_knowledge_workflow(
-    web_model=create_model(),
-    judge_model=create_model(),
+    web_model=create_model(RETRIEVAL_MODEL),
+    fast_judge_model=create_model(MODEL),
+    pro_judge_model=create_model(REASONING_MODEL),
 )
 
 root_agent = Agent(
@@ -85,11 +101,11 @@ root_agent = Agent(
     # telemetry reports this name as gen_ai.agent.name, and agents-cli reports the
     # manifest's value.
     name="sample_adk_agent",
-    model=create_model(),
+    model=create_model(MODEL),
     description=(
         "Personal Onboarding Trail Agent that captures links and screenshots into "
         "categorized cross-session memory and answers questions via a parallel "
-        "Trail Memory + Google Search workflow with an LLM judge."
+        "Trail Memory + Google Search workflow with complexity-routed Flash/Pro judging."
     ),
     instruction=AGENT_INSTRUCTION,
     tools=[

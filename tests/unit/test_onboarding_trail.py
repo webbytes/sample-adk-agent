@@ -28,7 +28,7 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 import app.tools as trail_tools
-from app.agent import root_agent
+from app.agent import MODEL, REASONING_MODEL, RETRIEVAL_MODEL, root_agent
 from app.observability import TrailObservabilityPlugin, classify_message_modality
 from app.schemas import DEFAULT_CATEGORIES, JudgedAnswer
 from app.tools import (
@@ -42,7 +42,7 @@ from app.tools import (
     search_trail_library,
     update_onboarding_profile,
 )
-from app.workflows import build_parallel_knowledge_workflow
+from app.workflows import build_parallel_knowledge_workflow, classify_query_complexity
 
 
 class ScriptedLlm(BaseLlm):
@@ -65,8 +65,12 @@ class ScriptedLlm(BaseLlm):
 
 
 def test_root_agent_wiring() -> None:
-    """Verify root_agent keeps manifest contract and exposes all trail tools."""
+    """Verify root_agent keeps manifest contract, model tiers, and trail tools."""
     assert root_agent.name == "sample_adk_agent"
+    assert RETRIEVAL_MODEL == "gemini-3.5-flash"
+    assert MODEL == "gemini-3.8-flash"
+    assert REASONING_MODEL == "gemini-3.1-pro-preview"
+    assert len({RETRIEVAL_MODEL, MODEL, REASONING_MODEL}) == 3
     tool_names = { getattr(t, "name", getattr(t, "__name__", "")) for t in root_agent.tools }
     expected = {
         "save_link_to_trail",
@@ -444,9 +448,39 @@ async def test_category_governance_and_screenshot_artifact() -> None:
     assert final_session.state[PROFILE_STATE_KEY]["role"] == "Forward Deployed Engineer"
 
 
+def test_strategic_complexity_classifier() -> None:
+    """Verify strategic router chooses fast Flash vs. deep Pro judge appropriately."""
+    route_fast, reason_fast = classify_query_complexity(
+        "What default port does adk web bind?",
+        trail_match_count=0,
+        memory_hit_count=0,
+        has_web_candidate=True,
+    )
+    assert route_fast == "fast_judge"
+    assert reason_fast == "single_source_factual_lookup"
+
+    route_multi, reason_multi = classify_query_complexity(
+        "What port does adk web bind?",
+        trail_match_count=1,
+        memory_hit_count=0,
+        has_web_candidate=True,
+    )
+    assert route_multi == "pro_judge"
+    assert reason_multi == "multi_source_reconciliation"
+
+    route_arch, reason_arch = classify_query_complexity(
+        "Compare the architecture trade-offs of Workflow vs sub_agents.",
+        trail_match_count=0,
+        memory_hit_count=0,
+        has_web_candidate=True,
+    )
+    assert route_arch == "pro_judge"
+    assert reason_arch == "complex_or_architectural_query"
+
+
 @pytest.mark.asyncio
 async def test_parallel_knowledge_workflow_and_judge() -> None:
-    """Verify ADK 2.0 fan-out + JoinNode + Judge workflow executes both branches."""
+    """Verify ADK 2.0 fan-out + JoinNode + strategic Pro/Flash judge routing."""
     web_fake = ScriptedLlm(
         [
             types.Content(
@@ -456,28 +490,52 @@ async def test_parallel_knowledge_workflow_and_judge() -> None:
                         text="Public docs state JoinNode merges parallel fan-out branches."
                     )
                 ],
-            )
+            ),
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text="adk web listens on port 8000 by default."
+                    )
+                ],
+            ),
         ]
     )
-    judged = JudgedAnswer(
+    pro_judged = JudgedAnswer(
         winning_source="trail_memory",
         confidence="high",
         rationale="The user's saved trail note directly covers ADK 2.0 JoinNode.",
         answer_markdown="Use `JoinNode` after a tuple fan-out edge to merge outputs.",
         citations=["https://google.github.io/adk-docs/workflows/parallel/"],
     )
-    judge_fake = ScriptedLlm(
+    fast_judged = JudgedAnswer(
+        winning_source="google_search",
+        confidence="high",
+        rationale="No saved trail entry matched; web search gives the default port.",
+        answer_markdown="`adk web` binds to port `8000` by default.",
+        citations=["https://google.github.io/adk-docs/get-started/"],
+    )
+    pro_judge_fake = ScriptedLlm(
         [
             types.Content(
                 role="model",
-                parts=[types.Part.from_text(text=json.dumps(judged.model_dump()))],
+                parts=[types.Part.from_text(text=json.dumps(pro_judged.model_dump()))],
+            )
+        ]
+    )
+    fast_judge_fake = ScriptedLlm(
+        [
+            types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=json.dumps(fast_judged.model_dump()))],
             )
         ]
     )
 
     wf = build_parallel_knowledge_workflow(
         web_model=web_fake,
-        judge_model=judge_fake,
+        fast_judge_model=fast_judge_fake,
+        pro_judge_model=pro_judge_fake,
         include_google_search_tool=False,
     )
 
@@ -497,11 +555,24 @@ async def test_parallel_knowledge_workflow_and_judge() -> None:
                 parts=[
                     types.Part.from_text(
                         text=(
-                            "Source: trail_memory. Use JoinNode "
+                            "Source: trail_memory (pro_judge). Use JoinNode "
                             "(https://google.github.io/adk-docs/workflows/parallel/)."
                         )
                     )
                 ],
+            ),
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_function_call(
+                        name="parallel_knowledge_lookup",
+                        args={"question": "What port does uvicorn bind?"},
+                    )
+                ],
+            ),
+            types.Content(
+                role="model",
+                parts=[types.Part.from_text(text="Port 8000 (fast_judge).")],
             ),
         ]
     )
@@ -537,7 +608,8 @@ async def test_parallel_knowledge_workflow_and_judge() -> None:
         },
     )
 
-    events = [
+    # Query 1: Matches both Trail Memory and Web -> escalates to 'pro_judge'
+    events_1 = [
         e
         async for e in runner.run_async(
             user_id="u_carol",
@@ -549,16 +621,43 @@ async def test_parallel_knowledge_workflow_and_judge() -> None:
         )
     ]
 
-    wf_responses = [
+    wf_responses_1 = [
         p.function_response.response
-        for e in events
+        for e in events_1
         if e.content
         for p in (e.content.parts or [])
         if p.function_response and p.function_response.name == "parallel_knowledge_lookup"
     ]
-    assert wf_responses
-    first_wf = wf_responses[0]
+    assert wf_responses_1
+    first_wf = wf_responses_1[0]
     assert first_wf is not None
-    payload = first_wf.get("result", first_wf)
-    assert payload["winning_source"] == "trail_memory"
-    assert "https://google.github.io/adk-docs/workflows/parallel/" in payload["citations"]
+    payload_1 = first_wf.get("result", first_wf)
+    assert payload_1["winning_source"] == "trail_memory"
+    assert payload_1["judge_tier"] == "pro_judge"
+    assert "https://google.github.io/adk-docs/workflows/parallel/" in payload_1["citations"]
+
+    # Query 2: Unmatched in Trail Memory + short factual query -> routes to 'fast_judge'
+    events_2 = [
+        e
+        async for e in runner.run_async(
+            user_id="u_carol",
+            session_id=session.id,
+            new_message=types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="What port does uvicorn bind?")],
+            ),
+        )
+    ]
+    wf_responses_2 = [
+        p.function_response.response
+        for e in events_2
+        if e.content
+        for p in (e.content.parts or [])
+        if p.function_response and p.function_response.name == "parallel_knowledge_lookup"
+    ]
+    assert wf_responses_2
+    second_wf = wf_responses_2[0]
+    assert second_wf is not None
+    payload_2 = second_wf.get("result", second_wf)
+    assert payload_2["winning_source"] == "google_search"
+    assert payload_2["judge_tier"] == "fast_judge"
