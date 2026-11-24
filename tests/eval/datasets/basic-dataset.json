@@ -1,0 +1,47 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "onboarding_capabilities_overview",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hi! I am a new Forward Deployed Engineer ramping up on Google ADK 2.0 and Agent Runtime. How can you help me track my onboarding?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "capture_public_adk_link",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "https://github.com/google/adk-python"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "parallel_grounded_adk_question",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What are the four session state prefixes in Google ADK Python and how does user-scoped state work across sessions?"
+          }
+        ]
+      },
+      "reference": {
+        "response": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Google ADK supports four session state scopes: unprefixed keys (current session only), user: (persisted across all sessions for that user), app: (shared across all users of the app), and temp: (discarded after the current invocation)."
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
