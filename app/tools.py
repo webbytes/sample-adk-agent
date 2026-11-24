@@ -25,7 +25,12 @@ from urllib.parse import urlparse
 from google.adk.tools import ToolContext
 from google.adk.tools.load_web_page import load_web_page
 
-from app.observability import tracer
+from app.observability import (
+    emit_structured_metric,
+    redact_pii_text,
+    sanitize_url_pii,
+    tracer,
+)
 from app.schemas import DEFAULT_CATEGORIES, OnboardingProfile, TrailEntry
 
 MAX_EXCERPT_CHARS = 3500
@@ -210,16 +215,24 @@ def save_link_to_trail(
     """
     url_clean = url.strip()
     if error := _validate_public_http_url(url_clean):
-        return {"status": "invalid_url", "url": url_clean, "message": error}
+        return {"status": "invalid_url", "url": sanitize_url_pii(url_clean), "message": error}
 
+    safe_url = sanitize_url_pii(url_clean)
     cat_slug, approval_needed = _check_or_propose_category(
         category, tool_context.state
     )
     if approval_needed is not None:
         return approval_needed
 
+    emit_structured_metric(
+        "web_fetch_intent",
+        phase="pre_execution",
+        target_url=safe_url,
+        category=cat_slug,
+    )
     with tracer.start_as_current_span("onboarding_trail.fetch_web_page") as span:
-        span.set_attribute("url.full", url_clean)
+        span.set_attribute("onboarding_trail.phase", "execution")
+        span.set_attribute("url.full", safe_url)
         fetched_text = load_web_page(url_clean)
         fetch_failed = fetched_text.startswith("Failed to fetch url:") or not fetched_text.strip()
         span.set_attribute("onboarding_trail.fetch_failed", fetch_failed)
@@ -227,9 +240,9 @@ def save_link_to_trail(
     if fetch_failed:
         return {
             "status": "fetch_failed",
-            "url": url_clean,
+            "url": safe_url,
             "message": (
-                f"Could not fetch '{url_clean}' directly (page may redirect, "
+                f"Could not fetch '{safe_url}' directly (page may redirect, "
                 "require JavaScript, or need authentication)."
             ),
             "fallback_instruction": (
@@ -240,17 +253,22 @@ def save_link_to_trail(
             ),
         }
 
-    title, final_summary = _derive_title_and_summary(url_clean, fetched_text, summary)
+    scrubbed_page = redact_pii_text(fetched_text)
+    title, final_summary = _derive_title_and_summary(
+        safe_url, scrubbed_page, redact_pii_text(summary)
+    )
     normalized_tags = sorted(
         {normalize_slug(t) for t in (tags or []) if str(t).strip()}
     )
     entry = TrailEntry(
-        entry_id=_entry_id_for_url(url_clean),
-        url=url_clean,
-        title=title,
-        summary=final_summary,
-        content_excerpt=fetched_text[:MAX_EXCERPT_CHARS],
-        key_takeaways=[t.strip() for t in (key_takeaways or []) if t.strip()][:8],
+        entry_id=_entry_id_for_url(safe_url),
+        url=safe_url,
+        title=redact_pii_text(title),
+        summary=redact_pii_text(final_summary),
+        content_excerpt=scrubbed_page[:MAX_EXCERPT_CHARS],
+        key_takeaways=[
+            redact_pii_text(t.strip()) for t in (key_takeaways or []) if t.strip()
+        ][:8],
         category=cat_slug,
         tags=normalized_tags,
         source_type="url",
@@ -292,6 +310,7 @@ def save_screenshot_to_trail(
     raw_url = extracted_url.strip() or "https://unknown-source.local/screenshot"
     if not raw_url.startswith(("http://", "https://")):
         raw_url = f"https://{raw_url}"
+    safe_url = sanitize_url_pii(raw_url)
 
     cat_slug, approval_needed = _check_or_propose_category(
         category, tool_context.state
@@ -303,16 +322,20 @@ def save_screenshot_to_trail(
         tool_context.state.get("last_uploaded_artifact")
         or tool_context.state.get("temp:staged_artifact")
     )
-    takeaways = [t.strip() for t in (key_takeaways or []) if t.strip()][:10]
+    safe_title = redact_pii_text(page_title.strip())[:140] or "Captured Screenshot"
+    safe_summary = redact_pii_text(content_summary.strip())[:800]
+    takeaways = [
+        redact_pii_text(t.strip()) for t in (key_takeaways or []) if t.strip()
+    ][:10]
     normalized_tags = sorted(
         {normalize_slug(t) for t in (tags or []) if str(t).strip()}
     )
-    excerpt_parts = [page_title.strip(), content_summary.strip(), *takeaways]
+    excerpt_parts = [safe_title, safe_summary, *takeaways]
     entry = TrailEntry(
-        entry_id=_entry_id_for_url(f"{raw_url}#{page_title.strip()}"),
-        url=raw_url,
-        title=page_title.strip()[:140] or "Captured Screenshot",
-        summary=content_summary.strip()[:800],
+        entry_id=_entry_id_for_url(f"{safe_url}#{safe_title}"),
+        url=safe_url,
+        title=safe_title,
+        summary=safe_summary,
         content_excerpt="\n".join(p for p in excerpt_parts if p)[:MAX_EXCERPT_CHARS],
         key_takeaways=takeaways,
         category=cat_slug,
@@ -428,18 +451,19 @@ def update_onboarding_profile(
         else OnboardingProfile()
     )
     if role.strip():
-        profile.role = role.strip()
+        profile.role = redact_pii_text(role.strip())
     if team_or_domain.strip():
-        profile.team_or_domain = team_or_domain.strip()
+        profile.team_or_domain = redact_pii_text(team_or_domain.strip())
     if focus_topics:
-        merged_focus = list(dict.fromkeys([*profile.focus_topics, *focus_topics]))
-        profile.focus_topics = merged_focus
+        cleaned_focus = [redact_pii_text(t) for t in focus_topics if str(t).strip()]
+        profile.focus_topics = list(dict.fromkeys([*profile.focus_topics, *cleaned_focus]))
     if learning_goals:
-        merged_goals = list(dict.fromkeys([*profile.learning_goals, *learning_goals]))
-        profile.learning_goals = merged_goals
+        cleaned_goals = [redact_pii_text(g) for g in learning_goals if str(g).strip()]
+        profile.learning_goals = list(dict.fromkeys([*profile.learning_goals, *cleaned_goals]))
     if completed_topics:
+        cleaned_done = [redact_pii_text(c) for c in completed_topics if str(c).strip()]
         merged_done = list(
-            dict.fromkeys([*profile.completed_topics, *completed_topics])
+            dict.fromkeys([*profile.completed_topics, *cleaned_done])
         )
         profile.completed_topics = merged_done
         profile.learning_goals = [

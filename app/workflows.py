@@ -27,7 +27,7 @@ from google.adk.tools import google_search
 from google.adk.workflow import JoinNode
 from google.genai import types
 
-from app.observability import emit_structured_metric, tracer
+from app.observability import emit_structured_metric, redact_pii_text, tracer
 from app.schemas import JudgedAnswer, KnowledgeQueryInput
 from app.tools import PROFILE_STATE_KEY, TRAIL_STATE_KEY, rank_trail_entries
 
@@ -82,10 +82,17 @@ async def retrieve_from_trail_and_memory(
     ctx: Context, node_input: KnowledgeQueryInput
 ) -> dict[str, Any]:
     """Branch 1: Search the user's saved trail library and cross-session memory."""
+    safe_question = redact_pii_text(node_input.question)
+    emit_structured_metric(
+        "parallel_branch_intent",
+        phase="pre_execution",
+        branch="trail_and_memory",
+        category_filter=node_input.category_filter,
+    )
     entries = list(ctx.state.get(TRAIL_STATE_KEY) or [])
     matches = rank_trail_entries(
         entries=entries,
-        query=node_input.question,
+        query=safe_question,
         category_filter=node_input.category_filter,
         limit=5,
     )
@@ -93,13 +100,13 @@ async def retrieve_from_trail_and_memory(
 
     memory_snippets: list[str] = []
     try:
-        mem_response = await ctx.search_memory(node_input.question)
+        mem_response = await ctx.search_memory(safe_question)
         for mem in getattr(mem_response, "memories", []) or []:
             content = getattr(mem, "content", None)
             if content and getattr(content, "parts", None):
                 text = " ".join(p.text for p in content.parts if p.text)
                 if text.strip():
-                    memory_snippets.append(text.strip()[:400])
+                    memory_snippets.append(redact_pii_text(text.strip())[:400])
     except Exception:
         # MemoryService is optional in standalone unit runners; degrade cleanly.
         memory_snippets = []
@@ -121,11 +128,12 @@ async def retrieve_from_trail_and_memory(
     with tracer.start_as_current_span(
         "onboarding_trail.workflow.trail_memory_branch"
     ) as span:
+        span.set_attribute("onboarding_trail.phase", "post_execution")
         span.set_attribute("onboarding_trail.trail_matches", len(compact_matches))
         span.set_attribute("onboarding_trail.memory_hits", len(memory_snippets))
 
     return {
-        "question": node_input.question,
+        "question": safe_question,
         "matched_count": len(compact_matches),
         "matches": compact_matches,
         "memory_snippets": memory_snippets[:5],
@@ -134,15 +142,22 @@ async def retrieve_from_trail_and_memory(
 
 
 def prepare_web_search_prompt(node_input: KnowledgeQueryInput) -> str:
-    """Format the question for the isolated Google Search grounding sub-agent."""
+    """Format a PII-scrubbed query and log intent before web grounding executes."""
+    safe_question = redact_pii_text(node_input.question)
+    emit_structured_metric(
+        "parallel_branch_intent",
+        phase="pre_execution",
+        branch="google_search_grounding",
+        category_filter=node_input.category_filter,
+    )
     if node_input.category_filter.strip():
         return (
             f"Question (topic: {node_input.category_filter.strip()}): "
-            f"{node_input.question}\n"
+            f"{safe_question}\n"
             "Provide an accurate technical answer with official public URLs."
         )
     return (
-        f"Question: {node_input.question}\n"
+        f"Question: {safe_question}\n"
         "Provide an accurate technical answer with official public URLs."
     )
 

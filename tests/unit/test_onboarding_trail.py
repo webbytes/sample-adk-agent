@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -29,7 +30,14 @@ from google.genai import types
 
 import app.tools as trail_tools
 from app.agent import MODEL, REASONING_MODEL, RETRIEVAL_MODEL, root_agent
-from app.observability import TrailObservabilityPlugin, classify_message_modality
+from app.observability import (
+    TrailObservabilityPlugin,
+    classify_message_modality,
+    classify_user_intent,
+    redact_pii_data,
+    redact_pii_text,
+    sanitize_url_pii,
+)
 from app.schemas import DEFAULT_CATEGORIES, JudgedAnswer
 from app.tools import (
     CATEGORIES_STATE_KEY,
@@ -661,3 +669,134 @@ async def test_parallel_knowledge_workflow_and_judge() -> None:
     payload_2 = second_wf.get("result", second_wf)
     assert payload_2["winning_source"] == "google_search"
     assert payload_2["judge_tier"] == "fast_judge"
+
+
+def test_pii_redaction_and_intent_classification() -> None:
+    """Verify deterministic PII redaction across text, URLs, dicts, and intents."""
+    raw = (
+        "Contact jane.doe@example.com or 415-555-0199; SSN 123-45-6789; "
+        "auth Bearer secretTokenValue123456."
+    )
+    scrubbed = redact_pii_text(raw)
+    assert "jane.doe@example.com" not in scrubbed
+    assert "415-555-0199" not in scrubbed
+    assert "123-45-6789" not in scrubbed
+    assert "secretTokenValue123456" not in scrubbed
+    assert "[REDACTED_EMAIL]" in scrubbed
+    assert "[REDACTED_PHONE]" in scrubbed
+    assert "[REDACTED_SSN]" in scrubbed
+    assert "[REDACTED_SECRET]" in scrubbed
+
+    dirty_url = "https://user:pass@docs.example.com/guide?api_key=abc123&topic=adk"
+    clean_url = sanitize_url_pii(dirty_url)
+    assert "user:pass" not in clean_url
+    assert "abc123" not in clean_url
+    assert "topic=adk" in clean_url
+
+    nested = redact_pii_data(
+        {"authorization": "Bearer topsecret12345", "note": "Email bob@example.org"}
+    )
+    assert nested["authorization"] == "[REDACTED_SECRET]"
+    assert "[REDACTED_EMAIL]" in nested["note"]
+
+    url_turn = types.Content(
+        role="user", parts=[types.Part.from_text(text="https://adk.dev")]
+    )
+    assert classify_user_intent(url_turn) == "capture_url_to_trail"
+
+
+@pytest.mark.asyncio
+async def test_pre_execution_intent_logs_and_pii_pipeline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify pre-execution intent events precede outcomes and scrub PII end-to-end."""
+    monkeypatch.setattr(
+        trail_tools,
+        "load_web_page",
+        lambda url: (
+            "ADK Auth Guide\n"
+            "Maintainer email: maintainer@example.com and SSN 123-45-6789."
+        ),
+    )
+
+    llm = ScriptedLlm(
+        [
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_function_call(
+                        name="save_link_to_trail",
+                        args={
+                            "url": "https://docs.example.com/auth?token=supersecret999",
+                            "category": "security",
+                        },
+                    )
+                ],
+            ),
+            types.Content(
+                role="model",
+                parts=[types.Part.from_text(text="Saved sanitized auth guide.")],
+            ),
+        ]
+    )
+
+    agent = Agent(
+        name="pii_test_agent",
+        model=llm,
+        instruction="Save links.",
+        tools=[save_link_to_trail],
+    )
+    test_app = App(
+        name="pii_app", root_agent=agent, plugins=[TrailObservabilityPlugin()]
+    )
+    runner = InMemoryRunner(app=test_app)
+    session = await runner.session_service.create_session(
+        app_name="pii_app", user_id="u_pii"
+    )
+
+    with caplog.at_level(logging.INFO, logger="onboarding_trail.telemetry"):
+        _ = [
+            e
+            async for e in runner.run_async(
+                user_id="u_pii",
+                session_id=session.id,
+                new_message=types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text="Save https://docs.example.com/auth?token=supersecret999 for alice@example.com"
+                        )
+                    ],
+                ),
+            )
+        ]
+
+    records = [json.loads(r.message) for r in caplog.records]
+    event_types = [r["event_type"] for r in records]
+    # Intent events are logged BEFORE execution outcomes
+    assert "user_intent_recorded" in event_types
+    assert "agent_intent_recorded" in event_types
+    assert "model_request_intent" in event_types
+    assert "tool_intent_recorded" in event_types
+    assert event_types.index("user_intent_recorded") < event_types.index(
+        "tool_intent_recorded"
+    )
+    assert event_types.index("tool_intent_recorded") < event_types.index(
+        "tool_completed"
+    )
+
+    # Zero raw PII or URL tokens appear anywhere in telemetry logs or stored state
+    raw_log_blob = "\n".join(r.message for r in caplog.records)
+    assert "alice@example.com" not in raw_log_blob
+    assert "maintainer@example.com" not in raw_log_blob
+    assert "supersecret999" not in raw_log_blob
+    assert "123-45-6789" not in raw_log_blob
+
+    stored = await runner.session_service.get_session(
+        app_name="pii_app", user_id="u_pii", session_id=session.id
+    )
+    assert stored is not None
+    entry = stored.state[TRAIL_STATE_KEY][0]
+    assert "supersecret999" not in entry["url"]
+    assert "maintainer@example.com" not in entry["content_excerpt"]
+    assert "[REDACTED_EMAIL]" in entry["content_excerpt"]
